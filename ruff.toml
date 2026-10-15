@@ -1,0 +1,4 @@
+# Lint and format configuration: `ruff check .` and `ruff format .` from this directory.
+required-version = ">=0.17"
+line-length = 120
+target-version = "py310"

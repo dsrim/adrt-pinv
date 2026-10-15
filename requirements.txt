@@ -1,0 +1,8 @@
+numpy>=2
+scipy>=1.11
+matplotlib>=3.8
+scikit-image>=0.22
+adrt==1.2.0
+sympy>=1.12        # exp_galois.py only
+pytest
+ruff>=0.17         # linting only (ruff check ., ruff format --check .)

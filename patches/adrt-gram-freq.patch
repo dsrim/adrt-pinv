@@ -1,0 +1,717 @@
+From 2b4fede01082095a8079b556543409a315416dd2 Mon Sep 17 00:00:00 2001
+From: dsrim <rim@wustl.edu>
+Date: Sat, 10 Oct 2026 02:25:38 -0500
+Subject: [PATCH] Add adrt.core.gram (row-wise offset-frequency normal
+ operator, C++ kernel gram_freq) and adrt.core.lstsq_cheb (fixed-degree
+ Chebyshev least squares); tests and docs
+
+---
+ docs/changes.rst             |   8 ++
+ docs/reference.core.rst      |  15 ++++
+ src/adrt/_adrt_cdefs.pyi     |   2 +
+ src/adrt/_wrappers.py        |   4 +
+ src/adrt/adrt_cdefs_gram.hpp | 151 +++++++++++++++++++++++++++++++
+ src/adrt/adrt_cdefs_py.cpp   |  78 ++++++++++++++++
+ src/adrt/core.py             | 168 +++++++++++++++++++++++++++++++++++
+ tests/test_gram.py           |  86 ++++++++++++++++++
+ tests/test_lstsq_cheb.py     |  70 +++++++++++++++
+ 9 files changed, 582 insertions(+)
+ create mode 100644 src/adrt/adrt_cdefs_gram.hpp
+ create mode 100644 tests/test_gram.py
+ create mode 100644 tests/test_lstsq_cheb.py
+
+diff --git a/docs/changes.rst b/docs/changes.rst
+index 65c451e..08984d9 100644
+--- a/docs/changes.rst
++++ b/docs/changes.rst
+@@ -6,6 +6,14 @@ version of `adrt`. More information and release builds are also
+ available on the `GitHub releases page
+ <https://github.com/karlotness/adrt/releases>`__.
+ 
++Unreleased
++----------
++
++* Add :func:`adrt.core.gram`, the normal operator :math:`R^T R`
++  applied row by row in the offset-frequency domain
++* Add :func:`adrt.core.lstsq_cheb`, a fixed-degree Chebyshev
++  least-squares inverse built on :func:`adrt.core.gram`
++
+ v1.2.0
+ ------
+ 
+diff --git a/docs/reference.core.rst b/docs/reference.core.rst
+index 0a15728..11b60da 100644
+--- a/docs/reference.core.rst
++++ b/docs/reference.core.rst
+@@ -55,3 +55,18 @@ for OpenMP. The function :func:`threading_enabled` queries whether
+ this support is enabled.
+ 
+ .. autofunction:: threading_enabled
++
++Normal Operator and Least Squares
++---------------------------------
++
++The normal operator :math:`R^T R` of the ADRT can be applied without
++forming the transform pair: after a Fourier transform in the offset,
++each quadrant is block diagonal with one butterfly matrix per offset
++frequency, and :func:`gram` applies their Gram matrices row by row.
++:func:`lstsq_cheb` uses it in a fixed-degree Chebyshev polynomial for
++the normal equations, a least-squares inverse whose cost is set in
++advance by a spectral interval.
++
++.. autofunction:: gram
++
++.. autofunction:: lstsq_cheb
+diff --git a/src/adrt/_adrt_cdefs.pyi b/src/adrt/_adrt_cdefs.pyi
+index bd32f06..c884ae5 100644
+--- a/src/adrt/_adrt_cdefs.pyi
++++ b/src/adrt/_adrt_cdefs.pyi
+@@ -36,6 +36,7 @@ import typing
+ import numpy.typing as npt
+ 
+ F = typing.TypeVar("F", np.float32, np.float64)
++C = typing.TypeVar("C", np.complex64, np.complex128)
+ 
+ OPENMP_ENABLED: typing.Final[bool]
+ 
+@@ -44,6 +45,7 @@ def adrt_step(a: npt.NDArray[F], step: int, /) -> npt.NDArray[F]: ...
+ def iadrt(a: npt.NDArray[F], /) -> npt.NDArray[F]: ...
+ def bdrt(a: npt.NDArray[F], /) -> npt.NDArray[F]: ...
+ def bdrt_step(a: npt.NDArray[F], step: int, /) -> npt.NDArray[F]: ...
++def gram_freq(a: npt.NDArray[C], omega: npt.NDArray[np.float32] | npt.NDArray[np.float64], /) -> npt.NDArray[C]: ...
+ def interp_to_cart(a: npt.NDArray[F], /) -> npt.NDArray[F]: ...
+ def press_fmg_restriction(a: npt.NDArray[F], /) -> npt.NDArray[F]: ...
+ def press_fmg_prolongation(a: npt.NDArray[F], /) -> npt.NDArray[F]: ...
+diff --git a/src/adrt/_wrappers.py b/src/adrt/_wrappers.py
+index 8887f3c..350cbba 100644
+--- a/src/adrt/_wrappers.py
++++ b/src/adrt/_wrappers.py
+@@ -388,3 +388,7 @@ def _press_fmg_prolongation(a: npt.NDArray[F], /) -> npt.NDArray[F]:
+ 
+ def _press_fmg_highpass(a: npt.NDArray[F], /) -> npt.NDArray[F]:
+     return _adrt_cdefs.press_fmg_highpass(_normalize_array(a))
++
++
++def _gram_freq(a: npt.NDArray[typing.Any], omega: npt.NDArray[typing.Any], /) -> npt.NDArray[typing.Any]:
++    return _adrt_cdefs.gram_freq(_normalize_array(a), _normalize_array(omega))
+diff --git a/src/adrt/adrt_cdefs_gram.hpp b/src/adrt/adrt_cdefs_gram.hpp
+new file mode 100644
+index 0000000..57d923b
+--- /dev/null
++++ b/src/adrt/adrt_cdefs_gram.hpp
+@@ -0,0 +1,151 @@
++/*
++ * Copyright 2026 Karl Otness, Donsub Rim
++ *
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice,
++ *    this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ *    contributors may be used to endorse or promote products derived from
++ *    this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef ADRT_CDEFS_GRAM_H
++#define ADRT_CDEFS_GRAM_H
++
++#include <array>
++#include <span>
++#include <complex>
++#include <vector>
++#include <cstring>
++#include <bit>
++#include <cmath>
++#include <cassert>
++#include "adrt_cdefs_common.hpp"
++
++// Offset-Fourier form of the single-quadrant ADRT and its Gram matrix.
++//
++// After a DFT in the offset, the cyclic single-quadrant ADRT of an N-by-N strip
++// (N = 2^n) is block diagonal: at offset frequency omega it is an N-by-N matrix
++// A_omega = B_n ... B_1, a product of n butterfly levels.  Level m pairs the
++// sections 2l, 2l+1 of width 2^(m-1) at each slope t into slopes 2t, 2t+1 with
++// the 2x2 block [[1, z^t], [1, z^(t+1)]], z = exp(i omega).  This file applies
++// the Gram matrix A_omega^* A_omega to one row (a length-N column vector) per
++// frequency, independently over rows; this is the core of the normal operator
++// R^T R evaluated row by row in cache.
++
++namespace adrt {
++
++    inline bool gram_freq_is_valid_shape(std::span<const size_t, 3> shape) {
++        // shape = (batch, rows, N); N must be a power of two
++        return std::has_single_bit(adrt::_common::get<2>(shape)) && adrt::_common::get<0>(shape) > 0u && adrt::_common::get<1>(shape) > 0u;
++    }
++
++    namespace _impl {
++
++    // in -> out through levels 1..n (forward); buffers swap each level, returns the buffer holding the result
++    template <typename real>
++    std::complex<real> *gram_row_forward(int n, const std::complex<real> *const ADRT_RESTRICT pw, std::complex<real> z,
++                                         std::complex<real> *a, std::complex<real> *b) {
++        const size_t N = 1_uz << n;
++        std::complex<real> *in = a, *out = b;
++        for(int m = 1; m <= n; ++m) {
++            const size_t w = 1_uz << (m - 1), ns = N / (2_uz * w);
++            for(size_t l = 0; l < ns; ++l) {
++                const std::complex<real> *const f0 = in + l * 2_uz * w;
++                const std::complex<real> *const f1 = f0 + w;
++                std::complex<real> *const o = out + l * 2_uz * w;
++                for(size_t t = 0; t < w; ++t) {
++                    const std::complex<real> u = pw[t] * f1[t];
++                    o[2_uz * t] = f0[t] + u;
++                    o[2_uz * t + 1_uz] = f0[t] + u * z;
++                }
++            }
++            std::swap(in, out);
++        }
++        return in;
++    }
++
++    // adjoint: levels n..1
++    template <typename real>
++    std::complex<real> *gram_row_adjoint(int n, const std::complex<real> *const ADRT_RESTRICT pw, std::complex<real> z,
++                                         std::complex<real> *a, std::complex<real> *b) {
++        const size_t N = 1_uz << n;
++        const std::complex<real> zc = std::conj(z);
++        std::complex<real> *in = a, *out = b;
++        for(int m = n; m >= 1; --m) {
++            const size_t w = 1_uz << (m - 1), ns = N / (2_uz * w);
++            for(size_t l = 0; l < ns; ++l) {
++                const std::complex<real> *const g = in + l * 2_uz * w;
++                std::complex<real> *const o0 = out + l * 2_uz * w;
++                std::complex<real> *const o1 = o0 + w;
++                for(size_t t = 0; t < w; ++t) {
++                    const std::complex<real> g0 = g[2_uz * t], g1 = g[2_uz * t + 1_uz];
++                    o0[t] = g0 + g1;
++                    o1[t] = std::conj(pw[t]) * (g0 + zc * g1);
++                }
++            }
++            std::swap(in, out);
++        }
++        return in;
++    }
++
++    } // end namespace adrt::_impl
++
++    // DOC ANCHOR: adrt.core.gram +2
++    // data, out: (batch, rows, N) complex, C order; omega: (rows,) real offset frequencies.
++    template <typename real>
++    void gram_freq(const std::complex<real> *const ADRT_RESTRICT data, std::span<const size_t, 3> shape,
++                   const real *const ADRT_RESTRICT omega, std::complex<real> *const ADRT_RESTRICT out) {
++        assert(data);
++        assert(omega);
++        assert(out);
++        assert(adrt::gram_freq_is_valid_shape(shape));
++        const size_t n_batch = adrt::_common::get<0>(shape), n_rows = adrt::_common::get<1>(shape), N = adrt::_common::get<2>(shape);
++        const int n = std::countr_zero(N);
++
++        ADRT_OPENMP("omp parallel default(none) shared(data, omega, out, n_batch, n_rows, N, n)")
++        {
++            std::vector<std::complex<real>> pw(N / 2_uz + 1_uz), buf_a(N), buf_b(N);
++            ADRT_OPENMP("omp for collapse(2) schedule(static)")
++            for(size_t batch = 0; batch < n_batch; ++batch) {
++                for(size_t row = 0; row < n_rows; ++row) {
++                    const std::complex<real> z = std::polar(static_cast<real>(1), omega[row]);
++                    pw[0] = std::complex<real>(1, 0);
++                    for(size_t t = 1; t < pw.size(); ++t) {
++                        pw[t] = pw[t - 1_uz] * z;
++                    }
++                    const size_t offset = (batch * n_rows + row) * N;
++                    std::memcpy(buf_a.data(), data + offset, N * sizeof(std::complex<real>));
++                    std::complex<real> *const fwd = adrt::_impl::gram_row_forward(n, pw.data(), z, buf_a.data(), buf_b.data());
++                    std::complex<real> *const other = (fwd == buf_a.data()) ? buf_b.data() : buf_a.data();
++                    const std::complex<real> *const res = adrt::_impl::gram_row_adjoint(n, pw.data(), z, fwd, other);
++                    std::memcpy(out + offset, res, N * sizeof(std::complex<real>));
++                }
++            }
++        }
++    }
++
++}
++
++#endif // ADRT_CDEFS_GRAM_H
+diff --git a/src/adrt/adrt_cdefs_py.cpp b/src/adrt/adrt_cdefs_py.cpp
+index 7c5f819..15fe50c 100644
+--- a/src/adrt/adrt_cdefs_py.cpp
++++ b/src/adrt/adrt_cdefs_py.cpp
+@@ -51,6 +51,8 @@
+ #include "adrt_cdefs_adrt.hpp"
+ #include "adrt_cdefs_iadrt.hpp"
+ #include "adrt_cdefs_bdrt.hpp"
++#include "adrt_cdefs_gram.hpp"
++#include <complex>
+ #include "adrt_cdefs_interp_adrtcart.hpp"
+ #include "adrt_cdefs_fmg.hpp"
+ 
+@@ -618,6 +620,81 @@ static PyObject *adrt_py_bdrt_step(PyObject* /* self */, PyObject *const *args,
+     }
+ }
+ 
++static PyObject *adrt_py_gram_freq(PyObject* /* self */, PyObject *const *args, Py_ssize_t nargs) {
++    // Process function arguments: (rows, omega)
++    const std::optional<std::span<PyObject *const, 2>> unpacked_args = adrt::_py::unpack_fastcall<2>(args, nargs, "gram_freq");
++    if(!unpacked_args) {
++        return nullptr;
++    }
++    PyArrayObject *const in_arr = adrt::_py::extract_array(adrt::_common::get<0>(*unpacked_args));
++    PyArrayObject *const om_arr = adrt::_py::extract_array(adrt::_common::get<1>(*unpacked_args));
++    if(!in_arr || !om_arr) {
++        return nullptr;
++    }
++    const std::optional<std::array<size_t, 3>> input_shape = adrt::_py::array_shape<2, 3>(in_arr);
++    if(!input_shape) {
++        return nullptr;
++    }
++    if(!adrt::gram_freq_is_valid_shape(*input_shape)) {
++        PyErr_SetString(PyExc_ValueError, "array must have shape (..., rows, N) with N a power of two");
++        return nullptr;
++    }
++    const std::optional<std::array<size_t, 1>> om_shape = adrt::_py::array_shape<1, 1>(om_arr);
++    if(!om_shape) {
++        return nullptr;
++    }
++    if(adrt::_common::get<0>(*om_shape) != adrt::_common::get<1>(*input_shape)) {
++        PyErr_SetString(PyExc_ValueError, "omega must have one entry per row");
++        return nullptr;
++    }
++    const int ndim = PyArray_NDIM(in_arr);
++    switch(PyArray_TYPE(in_arr)) {
++    case NPY_COMPLEX64:
++    {
++        if(PyArray_TYPE(om_arr) != NPY_FLOAT32) {
++            PyErr_SetString(PyExc_TypeError, "omega must be float32 for complex64 rows");
++            return nullptr;
++        }
++        PyArrayObject *const ret = adrt::_py::new_array(ndim, std::span{*input_shape}, NPY_COMPLEX64);
++        if(!ret) {
++            return nullptr;
++        }
++        const std::complex<float> *const in_data = static_cast<std::complex<float>*>(PyArray_DATA(in_arr));
++        const float *const om_data = static_cast<float*>(PyArray_DATA(om_arr));
++        std::complex<float> *const out_data = static_cast<std::complex<float>*>(PyArray_DATA(ret));
++        // NO PYTHON API BELOW THIS POINT
++        Py_BEGIN_ALLOW_THREADS
++        adrt::gram_freq(in_data, *input_shape, om_data, out_data);
++        // PYTHON API ALLOWED BELOW THIS POINT
++        Py_END_ALLOW_THREADS
++        return adrt::_py::array_to_pyobject(ret);
++    }
++    case NPY_COMPLEX128:
++    {
++        if(PyArray_TYPE(om_arr) != NPY_FLOAT64) {
++            PyErr_SetString(PyExc_TypeError, "omega must be float64 for complex128 rows");
++            return nullptr;
++        }
++        PyArrayObject *const ret = adrt::_py::new_array(ndim, std::span{*input_shape}, NPY_COMPLEX128);
++        if(!ret) {
++            return nullptr;
++        }
++        const std::complex<double> *const in_data = static_cast<std::complex<double>*>(PyArray_DATA(in_arr));
++        const double *const om_data = static_cast<double*>(PyArray_DATA(om_arr));
++        std::complex<double> *const out_data = static_cast<std::complex<double>*>(PyArray_DATA(ret));
++        // NO PYTHON API BELOW THIS POINT
++        Py_BEGIN_ALLOW_THREADS
++        adrt::gram_freq(in_data, *input_shape, om_data, out_data);
++        // PYTHON API ALLOWED BELOW THIS POINT
++        Py_END_ALLOW_THREADS
++        return adrt::_py::array_to_pyobject(ret);
++    }
++    default:
++        adrt::_py::report_unsupported_dtype(in_arr);
++        return nullptr;
++    }
++}
++
+ static PyObject *adrt_py_interp_adrtcart(PyObject* /* self */, PyObject *arg) {
+     // Process function arguments
+     PyArrayObject *const in_arr = adrt::_py::extract_array(arg);
+@@ -855,6 +932,7 @@ static PyMethodDef adrt_cdefs_methods[] = {
+     {"iadrt", adrt_py_iadrt, METH_O, "Compute the inverse ADRT"},
+     {"bdrt", adrt_py_bdrt, METH_O, "Compute the backprojection of the ADRT"},
+     {"bdrt_step", ADRT_PY_FASTCALL_METH(adrt_py_bdrt_step), METH_FASTCALL, "Compute one step of the bdrt"},
++    {"gram_freq", ADRT_PY_FASTCALL_METH(adrt_py_gram_freq), METH_FASTCALL, "Apply the offset-frequency Gram matrices of the single-quadrant ADRT row by row"},
+     {"interp_to_cart", adrt_py_interp_adrtcart, METH_O, "Interpolate ADRT output to Cartesian coordinate system"},
+     {"press_fmg_restriction", adrt_py_fmg_restriction, METH_O, "Multigrid restriction operator"},
+     {"press_fmg_prolongation", adrt_py_fmg_prolongation, METH_O, "Multigrid prolongation operator"},
+diff --git a/src/adrt/core.py b/src/adrt/core.py
+index d77112e..872d41f 100644
+--- a/src/adrt/core.py
++++ b/src/adrt/core.py
+@@ -70,6 +70,7 @@ from ._wrappers import (
+     _press_fmg_restriction,
+     _press_fmg_prolongation,
+     _press_fmg_highpass,
++    _gram_freq,
+     adrt as _adrt,
+     bdrt as _bdrt,
+ )
+@@ -84,6 +85,8 @@ __all__: typing.Final[collections.abc.Sequence[str]] = [
+     "threading_enabled",
+     "iadrt_fmg_step",
+     "iadrt_fmg_iter",
++    "gram",
++    "lstsq_cheb",
+ ]
+ 
+ 
+@@ -379,3 +382,168 @@ def iadrt_fmg_iter(
+         inv = inv + iadrt_fmg_step(a - _adrt(inv))  # type: ignore[assignment,type-var]
+         inv.setflags(write=False)
+         yield inv.copy() if copy else inv.view()
++
++
++def _quadrant_strip(x: npt.NDArray[_F], q: int, n: int, /) -> npt.NDArray[_F]:
++    # Torus image (..., 2n, 2n) -> strip (..., 2n, n) of quadrant q in the orientation of the base butterfly
++    r = (n - 1 - np.arange(2 * n)) % (2 * n)
++    if q == 0:
++        return np.swapaxes(x, -1, -2)[..., r, :n]
++    if q == 1:
++        return x[..., r, :n]
++    if q == 2:
++        return x[..., :, :n]
++    return np.swapaxes(x[..., r, :][..., :, r], -1, -2)[..., :n]
++
++
++def _quadrant_strip_adjoint(s: npt.NDArray[_F], q: int, n: int, /) -> npt.NDArray[_F]:
++    # Adjoint of _quadrant_strip: strip (..., 2n, n) -> torus image (..., 2n, 2n)
++    r = (n - 1 - np.arange(2 * n)) % (2 * n)
++    x = np.zeros(s.shape[:-1] + (2 * n,), dtype=s.dtype)
++    x[..., :n] = s
++    if q == 0:
++        return np.swapaxes(x[..., r, :], -1, -2)
++    if q == 1:
++        return x[..., r, :]
++    if q == 2:
++        return x
++    y = np.swapaxes(x, -1, -2)
++    return y[..., :, r][..., r, :]
++
++
++def gram(a: npt.NDArray[_F], /) -> npt.NDArray[_F]:
++    r"""Apply the normal operator of the ADRT, computed row by row in frequency.
++
++    Computes :math:`R^T R a` for square images `a`, where :math:`R` is
++    the ADRT of :func:`adrt.adrt`. The result equals
++    :pycode:`adrt.utils.truncate(adrt.bdrt(adrt.adrt(a))).sum(axis=-3)`
++    but is evaluated differently: after a discrete Fourier transform
++    in the offset, each quadrant of the ADRT becomes block diagonal,
++    one :math:`N \times N` butterfly matrix :math:`A_\omega` per
++    offset frequency, and :math:`R^T R` is applied as
++    :math:`A_\omega^* A_\omega` one frequency row at a time. Each row
++    is processed in cache, which is faster than the transform pair for
++    large `N`, and rows are distributed over threads when
++    :func:`threading_enabled` is :pycode:`True`. Two real quadrants are
++    processed together as the real and imaginary parts of one complex
++    array.
++
++    Parameters
++    ----------
++    a : numpy.ndarray of float
++        The images to which the normal operator is applied. Must have
++        square shape :pycode:`(..., N, N)` with `N` a power of two.
++
++    Returns
++    -------
++    numpy.ndarray of float
++        :math:`R^T R a`, with the same shape and dtype as `a`.
++    """
++    a = np.asarray(a)
++    if a.ndim < 2 or a.shape[-1] != a.shape[-2]:
++        raise ValueError(f"array must be square, but had shape {a.shape}")
++    n = a.shape[-1]
++    if n < 1 or n & (n - 1):
++        raise ValueError(f"array size must be a power of two, but was {n}")
++    if a.dtype == np.float32:
++        cdt, rdt = np.complex64, np.float32
++    elif a.dtype == np.float64:
++        cdt, rdt = np.complex128, np.float64
++    else:
++        raise TypeError(f"unsupported array dtype {a.dtype}")
++    batch = a.shape[:-2]
++    x = np.zeros(batch + (2 * n, 2 * n), dtype=a.dtype)
++    x[..., :n, :n] = a
++    packed = np.stack(
++        [
++            _quadrant_strip(x, 0, n) + 1j * _quadrant_strip(x, 1, n),
++            _quadrant_strip(x, 2, n) + 1j * _quadrant_strip(x, 3, n),
++        ],
++        axis=-3,
++    )
++    f = np.fft.fft(packed, axis=-2).astype(cdt, copy=False)
++    omega = (2 * np.pi * np.fft.fftfreq(2 * n)).astype(rdt)
++    g = _gram_freq(np.ascontiguousarray(f.reshape(-1, 2 * n, n)), omega)
++    w = np.fft.ifft(g.reshape(f.shape), axis=-2)
++    out = (
++        _quadrant_strip_adjoint(w[..., 0, :, :].real, 0, n)
++        + _quadrant_strip_adjoint(w[..., 0, :, :].imag, 1, n)
++        + _quadrant_strip_adjoint(w[..., 1, :, :].real, 2, n)
++        + _quadrant_strip_adjoint(w[..., 1, :, :].imag, 3, n)
++    )
++    return np.ascontiguousarray(out[..., :n, :n], dtype=a.dtype)
++
++
++def lstsq_cheb(
++    b: npt.NDArray[_F],
++    /,
++    *,
++    lam_min: float,
++    lam_max: float | None = None,
++    tol: float = 1e-10,
++    degree: typing.SupportsIndex | None = None,
++) -> npt.NDArray[_F]:
++    r"""Least-squares inverse of the ADRT by a fixed-degree Chebyshev polynomial.
++
++    Returns :math:`x_D = c_D(R^T R)\, R^T b`, the Chebyshev
++    semi-iteration of degree `D` for the normal equations
++    :math:`R^T R x = R^T b` on the spectral interval
++    :math:`[\lambda_{\min}, \lambda_{\max}]`. With a valid interval,
++    :math:`\|x_D - x_{\mathrm{LS}}\| \le 2 \rho^D \|x_{\mathrm{LS}}\|`,
++    :math:`\rho = (\sqrt\kappa - 1)/(\sqrt\kappa + 1)`, where
++    :math:`x_{\mathrm{LS}}` is the least-squares solution. The degree
++    is fixed in advance from the interval and `tol`; no residual is
++    tested. The normal operator is applied by :func:`gram`.
++
++    Parameters
++    ----------
++    b : numpy.ndarray of float
++        Data with the shape of an ADRT output, :pycode:`(..., 4, 2*N-1, N)`.
++    lam_min : float
++        A *lower bound* for the smallest eigenvalue of :math:`R^T R`.
++        Measured values are 15.5, 24.5, 35.7, 50.3, 68.0, 88.7 for
++        `N` = 8 to 256. An overestimate degrades the accuracy; an
++        underestimate only increases the degree.
++    lam_max : float, optional
++        An upper bound for the largest eigenvalue. If omitted it is
++        estimated by power iteration and enlarged by its residual norm.
++    tol : float, optional
++        Relative accuracy of the polynomial (default :pycode:`1e-10`).
++    degree : int, optional
++        Overrides the degree computed from the interval and `tol`.
++
++    Returns
++    -------
++    numpy.ndarray of float
++        The approximate least-squares solution, shape :pycode:`(..., N, N)`.
++    """
++    b = np.asarray(b)
++    if b.ndim < 3 or b.shape[-3] != 4 or b.shape[-2] != 2 * b.shape[-1] - 1:
++        raise ValueError(f"array must have the shape of an ADRT output, but had shape {b.shape}")
++    y = _truncate(_bdrt(np.ascontiguousarray(b))).sum(axis=-3)
++    if lam_max is None:
++        v = np.random.default_rng(0).standard_normal(y.shape[-2:]).astype(y.dtype)
++        v /= np.linalg.norm(v)
++        for _ in range(50):
++            w = gram(v)
++            v = w / np.linalg.norm(w)
++        w = gram(v)
++        theta = float(np.vdot(v, w))
++        lam_max = theta + float(np.linalg.norm(w - theta * v))
++    lo, hi = float(lam_min), float(lam_max)
++    if not 0 < lo < hi:
++        raise ValueError("need 0 < lam_min < lam_max")
++    kappa = hi / lo
++    if degree is None:
++        rho = (np.sqrt(kappa) - 1) / (np.sqrt(kappa) + 1)
++        deg = max(1, int(np.ceil(np.log(tol / 2) / np.log(rho))))
++    else:
++        deg = operator.index(degree)
++    c, a = (hi - lo) / (hi + lo), 2.0 / (hi + lo)
++    x_prev, x = np.zeros_like(y), a * y
++    om = 1.0
++    for k in range(1, deg):
++        om = 1.0 / (1.0 - c * c / 2.0) if k == 1 else 1.0 / (1.0 - c * c * om / 4.0)
++        r = y - gram(x)
++        x_prev, x = x, x + om * (a * r) + (om - 1.0) * (x - x_prev)
++    return x
+diff --git a/tests/test_gram.py b/tests/test_gram.py
+new file mode 100644
+index 0000000..87be733
+--- /dev/null
++++ b/tests/test_gram.py
+@@ -0,0 +1,86 @@
++# Copyright 2026 Karl Otness, Donsub Rim
++#
++# SPDX-License-Identifier: BSD-3-Clause
++#
++# Redistribution and use in source and binary forms, with or without
++# modification, are permitted provided that the following conditions
++# are met:
++#
++# 1. Redistributions of source code must retain the above copyright
++#    notice, this list of conditions and the following disclaimer.
++#
++# 2. Redistributions in binary form must reproduce the above copyright
++#    notice, this list of conditions and the following disclaimer in
++#    the documentation and/or other materials provided with the
++#    distribution.
++#
++# 3. Neither the name of the copyright holder nor the names of its
++#    contributors may be used to endorse or promote products derived
++#    from this software without specific prior written permission.
++#
++# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++# COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++# POSSIBILITY OF SUCH DAMAGE.
++
++
++import pytest
++import numpy as np
++import adrt
++
++
++def _normal_bdrt(a):
++    return adrt.utils.truncate(adrt.bdrt(adrt.adrt(a))).sum(axis=-3)
++
++
++@pytest.mark.parametrize("n", [1, 2, 4, 8, 16, 32, 64])
++def test_matches_bdrt_float64(n):
++    a = np.random.default_rng(n).standard_normal((n, n))
++    ref = _normal_bdrt(a)
++    out = adrt.core.gram(a)
++    assert out.shape == a.shape
++    assert out.dtype == np.float64
++    assert np.allclose(out, ref, rtol=0, atol=1e-11 * np.abs(ref).max())
++
++
++@pytest.mark.parametrize("n", [4, 16, 32])
++def test_matches_bdrt_float32(n):
++    a = np.random.default_rng(n).standard_normal((n, n)).astype(np.float32)
++    ref = _normal_bdrt(a.astype(np.float64))
++    out = adrt.core.gram(a)
++    assert out.dtype == np.float32
++    assert np.allclose(out, ref, rtol=0, atol=2e-5 * np.abs(ref).max())
++
++
++def test_batch():
++    a = np.random.default_rng(0).standard_normal((3, 2, 16, 16))
++    out = adrt.core.gram(a)
++    for i in range(3):
++        for j in range(2):
++            assert np.allclose(out[i, j], _normal_bdrt(a[i, j]), rtol=0, atol=1e-10 * np.abs(out).max())
++
++
++def test_symmetric_positive():
++    rng = np.random.default_rng(1)
++    u, v = rng.standard_normal((2, 16, 16))
++    assert np.isclose(np.vdot(adrt.core.gram(u), v), np.vdot(u, adrt.core.gram(v)))
++    assert np.vdot(adrt.core.gram(u), u) > 0
++
++
++@pytest.mark.parametrize("shape", [(4, 8), (6, 6), (8,)])
++def test_rejects_bad_shape(shape):
++    with pytest.raises(ValueError):
++        adrt.core.gram(np.zeros(shape))
++
++
++def test_rejects_int():
++    with pytest.raises(TypeError):
++        adrt.core.gram(np.zeros((8, 8), dtype=np.int64))
+diff --git a/tests/test_lstsq_cheb.py b/tests/test_lstsq_cheb.py
+new file mode 100644
+index 0000000..6c7bab4
+--- /dev/null
++++ b/tests/test_lstsq_cheb.py
+@@ -0,0 +1,70 @@
++# Copyright 2026 Karl Otness, Donsub Rim
++#
++# SPDX-License-Identifier: BSD-3-Clause
++#
++# Redistribution and use in source and binary forms, with or without
++# modification, are permitted provided that the following conditions
++# are met:
++#
++# 1. Redistributions of source code must retain the above copyright
++#    notice, this list of conditions and the following disclaimer.
++#
++# 2. Redistributions in binary form must reproduce the above copyright
++#    notice, this list of conditions and the following disclaimer in
++#    the documentation and/or other materials provided with the
++#    distribution.
++#
++# 3. Neither the name of the copyright holder nor the names of its
++#    contributors may be used to endorse or promote products derived
++#    from this software without specific prior written permission.
++#
++# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++# COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++# POSSIBILITY OF SUCH DAMAGE.
++
++
++import pytest
++import numpy as np
++import adrt
++
++
++def _dense_adrt(n):
++    cols = []
++    for j in range(n * n):
++        e = np.zeros(n * n)
++        e[j] = 1
++        cols.append(adrt.adrt(e.reshape(n, n)).ravel())
++    return np.array(cols).T
++
++
++@pytest.mark.parametrize("n", [4, 8, 16])
++def test_matches_lstsq(n):
++    rng = np.random.default_rng(n)
++    mat = _dense_adrt(n)
++    eig = np.linalg.eigvalsh(mat.T @ mat)
++    b = adrt.adrt(rng.standard_normal((n, n))) + 0.1 * rng.standard_normal((4, 2 * n - 1, n))
++    ref = np.linalg.lstsq(mat, b.ravel(), rcond=None)[0].reshape(n, n)
++    out = adrt.core.lstsq_cheb(b, lam_min=0.99 * eig[0], lam_max=1.01 * eig[-1], tol=1e-10)
++    assert np.linalg.norm(out - ref) <= 1e-8 * np.linalg.norm(ref)
++
++
++def test_estimated_lam_max():
++    n = 8
++    rng = np.random.default_rng(3)
++    x = rng.standard_normal((n, n))
++    out = adrt.core.lstsq_cheb(adrt.adrt(x), lam_min=15.0)
++    assert np.linalg.norm(out - x) <= 1e-8 * np.linalg.norm(x)
++
++
++def test_rejects_bad_interval():
++    with pytest.raises(ValueError):
++        adrt.core.lstsq_cheb(adrt.adrt(np.zeros((8, 8))), lam_min=10.0, lam_max=5.0)
+-- 
+2.39.3
+
