@@ -84,3 +84,5 @@ ruff check .
 BSD 3-Clause; see `LICENSE`. The file `patches/adrt-gram-freq.patch` modifies the `adrt` package
 (https://pypi.org/project/adrt/), which is distributed under its own BSD 3-Clause license; the patched
 package remains subject to that license.
+
+[![DOI](https://zenodo.org/badge/1421438382.svg)](https://doi.org/10.5281/zenodo.23406686)
